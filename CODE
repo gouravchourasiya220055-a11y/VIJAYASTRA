@@ -1,0 +1,388 @@
+#include <Arduino.h>
+#include <Servo.h>
+
+// =====================================
+// 1. IR SENSORS (3 SENSORS)
+// =====================================
+const byte IR_SENSOR_LEFT   = 12;
+const byte IR_SENSOR_CENTER = 11;
+const byte IR_SENSOR_RIGHT  = 10;
+
+const int BLACK_VALUE = HIGH;   // Black par HIGH. Agar ulta ho to LOW kar dena.
+
+// =====================================
+// 2. L298N MOTOR DRIVER
+// =====================================
+const byte IN1 = 30;
+const byte IN2 = 31;
+const byte IN3 = 32;
+const byte IN4 = 33;
+
+const byte ENA = 8;
+const byte ENB = 9;
+
+// =====================================
+// 3. SPEED SETTINGS (HEAVY MOTOR)
+// =====================================
+const int MAX_SPEED = 110;
+const int TURN_SPEED = 180;
+const int WIDE_TURN_SLOW = 90;
+const int SPEED_STEP = 5;
+
+const unsigned long RAMP_INTERVAL_MS = 15;
+const unsigned long PRINT_INTERVAL_MS = 250;
+const unsigned long TURN_BOOST_MS = 100;
+
+int currentSpeed = 0;
+int targetSpeed = 0;
+
+unsigned long lastRampTime = 0;
+unsigned long lastPrint = 0;
+
+// =====================================
+// 4. SERVO SETTINGS (4 SERVOS)
+// =====================================
+Servo servo1;
+Servo servo2;
+Servo servo3;
+Servo servo4;
+
+const byte SERVO1_PIN = 4;
+const byte SERVO2_PIN = 5;
+const byte SERVO3_PIN = 6;
+const byte SERVO4_PIN = 7;
+
+// ---- HAR SERVO KE 3 ANGLES (APNI MARZI SE BADLO) ----
+// 1st angle = START (jahan arm ruki rahegi normally)
+// 2nd angle = MIDDLE (jab 5 sec white mile)
+// 3rd angle = END (final position)
+
+const int S1_START  = 0;     // 1st angle
+const int S1_MIDDLE = 30;    // 2nd angle
+const int S1_END    = 50;   // 3rd angle
+
+const int S2_START  = 0;
+const int S2_MIDDLE = 45;
+const int S2_END    = 65;
+
+const int S3_START  = 0;
+const int S3_MIDDLE = 30;
+const int S3_END    = 60;
+
+const int S4_START  = 0;
+const int S4_MIDDLE = 30;
+const int S4_END    = 60;
+
+// ---- SERVO MOVE TIMING ----
+const unsigned long SERVO_MOVE_DELAY_MS = 800;   // har angle par rukne ka time
+const unsigned long SERVO_STEP_DELAY_MS = 15;    // smooth movement
+const int SERVO_STEP_DEG = 2;                    // step size
+
+// =====================================
+// 5. 5-SECOND WHITE DETECTION TIMER
+// =====================================
+const unsigned long WHITE_TIMEOUT_MS = 5000;     // 5 second
+unsigned long whiteStartTime = 0;
+bool whiteTimerRunning = false;
+
+// =====================================
+// 6. MOTOR CONTROL (REVERSED)
+// =====================================
+void rotateMotor(int rightMotorSpeed, int leftMotorSpeed) {
+
+  rightMotorSpeed = constrain(rightMotorSpeed, -255, 255);
+  leftMotorSpeed  = constrain(leftMotorSpeed, -255, 255);
+
+  if (rightMotorSpeed < 0) {
+    digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  } else if (rightMotorSpeed > 0) {
+    digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  } else {
+    digitalWrite(IN1, LOW);  digitalWrite(IN2, LOW);
+  }
+
+  if (leftMotorSpeed < 0) {
+    digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  } else if (leftMotorSpeed > 0) {
+    digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+  } else {
+    digitalWrite(IN3, LOW);  digitalWrite(IN4, LOW);
+  }
+
+  analogWrite(ENA, abs(rightMotorSpeed));
+  analogWrite(ENB, abs(leftMotorSpeed));
+}
+
+// =====================================
+// 7. STOP MOTORS
+// =====================================
+void stopMotors() {
+  rotateMotor(0, 0);
+  currentSpeed = 0;
+  targetSpeed = 0;
+  lastRampTime = millis();
+}
+
+// =====================================
+// 8. GRADUAL SPEED
+// =====================================
+int updateSpeed(int desiredSpeed) {
+  desiredSpeed = constrain(desiredSpeed, 0, MAX_SPEED);
+  unsigned long now = millis();
+
+  if (now - lastRampTime >= RAMP_INTERVAL_MS) {
+    lastRampTime = now;
+
+    if (currentSpeed < desiredSpeed) {
+      currentSpeed += SPEED_STEP;
+      if (currentSpeed > desiredSpeed) currentSpeed = desiredSpeed;
+    }
+    else if (currentSpeed > desiredSpeed) {
+      currentSpeed -= SPEED_STEP;
+      if (currentSpeed < desiredSpeed) currentSpeed = desiredSpeed;
+    }
+  }
+  return currentSpeed;
+}
+
+// =====================================
+// 9. SERVO FUNCTIONS
+// =====================================
+
+// Ek servo ko smoothly target angle par le jao
+void moveServoSmooth(Servo &servo, int targetAngle) {
+  int currentAngle = servo.read();
+
+  if (currentAngle < targetAngle) {
+    for (int a = currentAngle; a <= targetAngle; a += SERVO_STEP_DEG) {
+      servo.write(a);
+      delay(SERVO_STEP_DELAY_MS);
+    }
+  } else {
+    for (int a = currentAngle; a >= targetAngle; a -= SERVO_STEP_DEG) {
+      servo.write(a);
+      delay(SERVO_STEP_DELAY_MS);
+    }
+  }
+  servo.write(targetAngle);
+}
+
+// Chaaro servo ko ek specific angle index par le jao
+// angleIndex: 0 = START, 1 = MIDDLE, 2 = END
+void moveAllServosTo(int angleIndex) {
+  int s1Target, s2Target, s3Target, s4Target;
+
+  if (angleIndex == 0) {
+    s1Target = S1_START;  s2Target = S2_START;
+    s3Target = S3_START;  s4Target = S4_START;
+  }
+  else if (angleIndex == 1) {
+    s1Target = S1_MIDDLE; s2Target = S2_MIDDLE;
+    s3Target = S3_MIDDLE; s4Target = S4_MIDDLE;
+  }
+  else {
+    s1Target = S1_END;    s2Target = S2_END;
+    s3Target = S3_END;    s4Target = S4_END;
+  }
+
+  moveServoSmooth(servo1, s1Target);
+  moveServoSmooth(servo2, s2Target);
+  moveServoSmooth(servo3, s3Target);
+  moveServoSmooth(servo4, s4Target);
+
+  Serial.print("SERVO -> ");
+  if (angleIndex == 0) Serial.println("1st ANGLE (START)");
+  else if (angleIndex == 1) Serial.println("2nd ANGLE (MIDDLE)");
+  else Serial.println("3rd ANGLE (END)");
+}
+
+// =====================================
+// 10. ARM SEQUENCE (5 second baad chalega)
+// =====================================
+void runArmSequence() {
+
+  Serial.println("=== 5 SEC WHITE DETECTED ===");
+  Serial.println("=== ARM SEQUENCE START ===");
+
+  // 1st angle par pehle se hi hai (kuch nahi karna)
+  Serial.println("At 1st ANGLE (already here)");
+  delay(SERVO_MOVE_DELAY_MS);
+
+  // 2nd angle par jao
+  moveAllServosTo(1);
+  delay(SERVO_MOVE_DELAY_MS);
+
+  // 3rd angle par jao
+  moveAllServosTo(2);
+  delay(SERVO_MOVE_DELAY_MS);
+
+  // Wapas 1st angle par reset
+  moveAllServosTo(0);
+  delay(SERVO_MOVE_DELAY_MS);
+
+  Serial.println("=== ARM SEQUENCE END ===");
+}
+
+// =====================================
+// 11. SETUP
+// =====================================
+void setup() {
+  Serial.begin(9600);
+
+  // IR sensors
+  pinMode(IR_SENSOR_LEFT,   INPUT);
+  pinMode(IR_SENSOR_CENTER, INPUT);
+  pinMode(IR_SENSOR_RIGHT,  INPUT);
+
+  // Motor driver
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(ENA, OUTPUT);
+  pinMode(ENB, OUTPUT);
+
+  stopMotors();
+
+  // Servo attach
+  servo1.attach(SERVO1_PIN);
+  servo2.attach(SERVO2_PIN);
+  servo3.attach(SERVO3_PIN);
+  servo4.attach(SERVO4_PIN);
+
+  // Sab servo 1st angle (START) par le jao
+  servo1.write(S1_START);
+  servo2.write(S2_START);
+  servo3.write(S3_START);
+  servo4.write(S4_START);
+
+  delay(500);
+
+  Serial.println("================================");
+  Serial.println("LINE FOLLOWER + 4 SERVO READY");
+  Serial.println("Logic: 5 sec WHITE -> Arm sequence");
+  Serial.println("Servo pins: D4 D5 D6 D7");
+  Serial.println("MAX_SPEED: 130 | TURN: 180");
+  Serial.println("================================");
+}
+
+// =====================================
+// 12. MAIN LOOP
+// =====================================
+void loop() {
+
+  int leftIR   = digitalRead(IR_SENSOR_LEFT);
+  int centerIR = digitalRead(IR_SENSOR_CENTER);
+  int rightIR  = digitalRead(IR_SENSOR_RIGHT);
+
+  bool leftBlack   = (leftIR   == BLACK_VALUE);
+  bool centerBlack = (centerIR == BLACK_VALUE);
+  bool rightBlack  = (rightIR  == BLACK_VALUE);
+
+  const char* action = "STOP";
+  int pwm = 0;
+
+  // =====================================================
+  // CASE 1: CENTER black -> FORWARD
+  // =====================================================
+  if (centerBlack) {
+
+    whiteTimerRunning = false;       // line mil gayi -> timer reset
+    whiteStartTime = 0;
+
+    targetSpeed = MAX_SPEED;
+    pwm = updateSpeed(targetSpeed);
+    rotateMotor(pwm, pwm);
+    action = "FORWARD";
+  }
+
+  // =====================================================
+  // CASE 2: LEFT black -> TURN LEFT
+  // =====================================================
+  else if (leftBlack) {
+
+    whiteTimerRunning = false;
+    whiteStartTime = 0;
+
+    stopMotors();
+    rotateMotor(-TURN_SPEED, WIDE_TURN_SLOW);
+    delay(TURN_BOOST_MS);
+    pwm = TURN_SPEED;
+    action = "TURN LEFT";
+  }
+
+  // =====================================================
+  // CASE 3: RIGHT black -> TURN RIGHT
+  // =====================================================
+  else if (rightBlack) {
+
+    whiteTimerRunning = false;
+    whiteStartTime = 0;
+
+    stopMotors();
+    rotateMotor(WIDE_TURN_SLOW, -TURN_SPEED);
+    delay(TURN_BOOST_MS);
+    pwm = TURN_SPEED;
+    action = "TURN RIGHT";
+  }
+
+  // =====================================================
+  // CASE 4: Sab WHITE -> 5 second timer chalao
+  // =====================================================
+  else {
+
+    stopMotors();
+    action = "WHITE (WAITING)";
+
+    unsigned long now = millis();
+
+    // Timer pehli baar start karo
+    if (!whiteTimerRunning) {
+      whiteTimerRunning = true;
+      whiteStartTime = now;
+      Serial.println("WHITE detected -> 5 sec timer START");
+    }
+
+    // Check karo 5 second poore hue ya nahi
+    if (now - whiteStartTime >= WHITE_TIMEOUT_MS) {
+
+      Serial.println("5 SEC COMPLETE -> ARM CHALU");
+
+      runArmSequence();
+
+      // Sequence ke baad timer reset karo
+      whiteTimerRunning = false;
+      whiteStartTime = 0;
+
+      action = "ARM DONE";
+    }
+  }
+
+  // =====================================================
+  // SERIAL MONITOR
+  // =====================================================
+  if (millis() - lastPrint >= PRINT_INTERVAL_MS) {
+    lastPrint = millis();
+
+    Serial.print("L:");
+    Serial.print(leftIR);
+    Serial.print(" C:");
+    Serial.print(centerIR);
+    Serial.print(" R:");
+    Serial.print(rightIR);
+    Serial.print(" | ");
+    Serial.print(action);
+
+    if (whiteTimerRunning) {
+      unsigned long elapsed = millis() - whiteStartTime;
+      Serial.print(" | White: ");
+      Serial.print(elapsed / 1000.0);
+      Serial.print("s / 5.0s");
+    }
+
+    Serial.print(" | PWM: ");
+    Serial.println(pwm);
+  }
+
+  delay(5);
+}
